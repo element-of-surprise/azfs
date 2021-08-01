@@ -11,6 +11,8 @@ This package supports two additional features over io.FS capabilities:
 This currently only support Block Blobs, not Append or Page. We may offer that
 in the future with enough demand.
 
+NOTE: NUMBER ONE MISTAKE: FORGETTING .CLOSE() on WRITING A FILE, SO IT DOESN"T WRITE THE FILE.
+
 Open a Blob storage container:
 	cred, err := msi.Token(msi.SystemAssigned{Resource: "https://resource"})
 	if err != nil {
@@ -106,14 +108,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"math"
 	"net/url"
 	"path"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/johnsiilver/golib/signal"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -124,6 +129,11 @@ type File struct {
 	u       azblob.BlockBlobURL
 	fi      fileInfo
 	path    string // The full path, used for directories
+
+	// These are related to locking
+	leaseID string
+	expires time.Time
+	closed  signal.Signaler
 
 	mu sync.Mutex
 
@@ -167,6 +177,10 @@ func (f *File) Write(p []byte) (n int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.leaseID != "" && time.Now().After(f.expires) {
+		return 0, fmt.Errorf("lost lock on file")
+	}
+
 	if f.writer == nil {
 		r, w := io.Pipe()
 		f.writer = w
@@ -206,6 +220,11 @@ func (f *File) Close() error {
 		f.writeWait.Wait()
 		return f.writeErr
 	}
+	if !reflect.ValueOf(f.closed).IsZero() {
+		defer f.closed.Close()
+		f.closed.Signal(nil, signal.Wait())
+	}
+
 	return nil
 }
 
@@ -222,6 +241,49 @@ func (f *File) fetchReader() error {
 
 	f.reader = resp.Body(azblob.RetryReaderOptions{})
 	return nil
+}
+
+// renew renews a lease lock on the file if one exists.
+func (f *File) renew() {
+	renewAt := time.Until(f.expires) / 2
+	if renewAt < 0 {
+		return
+	}
+
+	go func() {
+		timer := time.NewTicker(renewAt)
+		for {
+			select {
+			case <-timer.C:
+				if err := f.renewLease(); err != nil {
+					log.Printf("(%s) problem renewing lease: %s", f.path, err)
+				}
+				return
+			case ack := <-f.closed.Receive():
+				ack.Ack(nil)
+				return
+			}
+		}
+	}()
+}
+
+func (f *File) renewLease() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Until(f.expires))
+	defer cancel()
+
+	for {
+		lease, err := f.u.RenewLease(ctx, f.leaseID, azblob.ModifiedAccessConditions{})
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			continue
+		}
+		f.mu.Lock()
+		f.leaseID = lease.LeaseID()
+		f.expires = lease.Date().Add(60 * time.Second)
+		return nil
+	}
 }
 
 // ReadDir implements fs.ReadDirFile.ReadDir().
@@ -358,33 +420,6 @@ func (d dirEntry) Type() fs.FileMode {
 func (d dirEntry) Info() (fs.FileInfo, error) {
 	return d.fi, nil
 }
-
-/*
-type Notification chan struct{}
-
-type Lock struct {
-	mu     sync.Mutex
-	notify Notification
-}
-
-func (l *Lock) Unlock() {
-
-}
-
-func (l *Lock) Renew(d *time.Duration) {
-
-}
-
-func (l *Lock) Notify() Notification {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.notify == nil {
-		l.notify = make(Notification)
-	}
-	return l.notify
-}
-*/
 
 // FS implements io/fs.FS
 type FS struct {
@@ -527,6 +562,7 @@ type rwOptions struct {
 type RWOption func(o *rwOptions)
 
 // WithLock locks the file and attempts to keep it locked until the file is closed.
+// If the file in question is a directory, no lease it taken out.
 func WithLock() RWOption {
 	return func(o *rwOptions) {
 		o.lock = true
@@ -541,15 +577,15 @@ func WithTransferManager(tm azblob.TransferManager) RWOption {
 	}
 }
 
+// These are a subset of what is in "os" that is supported by this file systm.
 const (
 	O_RDONLY int = syscall.O_RDONLY // open the file read-only.
 	O_WRONLY int = syscall.O_WRONLY // open the file write-only.
-	O_RDWR   int = syscall.O_RDWR   // open the file read-write.
 	// The remaining values may be or'ed in to control behavior.
-	O_APPEND int = syscall.O_APPEND // append data to the file when writing.
-	O_CREATE int = syscall.O_CREAT  // create a new file if none exists.
-	O_EXCL   int = syscall.O_EXCL   // used with O_CREATE, file must not exist.
-	O_TRUNC  int = syscall.O_TRUNC  // truncate regular writable file when opened.
+	//O_APPEND int = syscall.O_APPEND // append data to the file when writing.
+	O_CREATE int = syscall.O_CREAT // create a new file if none exists.
+	O_EXCL   int = syscall.O_EXCL  // used with O_CREATE, file must not exist.
+	O_TRUNC  int = syscall.O_TRUNC // truncate regular writable file when opened.
 )
 
 func isFlagSet(flags int, flag int) bool {
@@ -565,8 +601,9 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 	}
 
 	if opts.lock {
-		// Do lock stuff and pass an autorenew lock to *File
-		panic("add")
+		if !isFlagSet(flags, O_WRONLY) {
+			return nil, fmt.Errorf("only O_WRONLY support for locks")
+		}
 	}
 
 	if isFlagSet(flags, O_RDONLY) {
@@ -587,7 +624,7 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 		name = ""
 	}
 
-	propCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	propCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	dir, err := f.dirFile(propCtx, name)
@@ -595,6 +632,19 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 		return dir, nil
 	}
 	u := f.containerURL.NewBlobURL(name)
+
+	var (
+		lresp   *azblob.BlobAcquireLeaseResponse
+		expires time.Time
+	)
+	if opts.lock {
+		expires = time.Now().Add(60 * time.Second)
+		lresp, err = u.AcquireLease(propCtx, "", 60, azblob.ModifiedAccessConditions{})
+		if err != nil {
+			return nil, fmt.Errorf("could not acquire lease on file(%s): %w", name, err)
+		}
+	}
+
 	props, err := u.GetProperties(propCtx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 
 	// NOTE: These are not fully implemented because I have no idea what all the return
@@ -617,18 +667,20 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 		}
 	}
 
-	return &File{
-		flags: flags,
-		u:     u.ToBlockBlobURL(),
-		fi:    newFileInfo(name, props),
-	}, nil
-}
+	file := &File{
+		flags:   flags,
+		u:       u.ToBlockBlobURL(),
+		fi:      newFileInfo(name, props),
+		leaseID: lresp.LeaseID(),
+		expires: expires,
+		closed:  signal.New(),
+	}
 
-/*
-func (f *FS) Lock(name string, d *time.Duration) (*Lock, error) {
-	return nil, nil
+	if file.leaseID != "" {
+		file.renew()
+	}
+	return file, nil
 }
-*/
 
 // Sys is returned on a FileInfo.Sys() call.
 type Sys struct {
