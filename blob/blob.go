@@ -192,7 +192,14 @@ func (f *File) Write(p []byte) (n int, err error) {
 				context.Background(),
 				r,
 				f.u.ToBlockBlobURL(),
-				azblob.UploadStreamToBlockBlobOptions{TransferManager: f.transferManager},
+				azblob.UploadStreamToBlockBlobOptions{
+					TransferManager: f.transferManager,
+					AccessConditions: azblob.BlobAccessConditions{
+						LeaseAccessConditions: azblob.LeaseAccessConditions{
+							LeaseID: f.leaseID,
+						},
+					},
+				},
 			)
 			if err != nil {
 				f.mu.Lock()
@@ -215,27 +222,29 @@ func (f *File) Close() error {
 	if f.reader != nil {
 		return f.reader.Close()
 	}
+
 	if f.writer != nil {
 		f.writer.Close()
 		f.writeWait.Wait()
+
+		if !reflect.ValueOf(f.closed).IsZero() {
+			defer f.closed.Close()
+			f.closed.Signal(nil, signal.Wait())
+			f.releaseLease()
+		}
 		return f.writeErr
-	}
-	if !reflect.ValueOf(f.closed).IsZero() {
-		defer f.closed.Close()
-		f.closed.Signal(nil, signal.Wait())
-		f.breakLease()
 	}
 
 	return nil
 }
 
-// breakLease will break a file lease or attempt to until the lease expires.
-func (f *File) breakLease() {
-	breakCtx, cancel := context.WithDeadline(context.Background(), f.expires)
+// releaseLease will break a file lease or attempt to until the lease expires.
+func (f *File) releaseLease() {
+	releaseCtx, cancel := context.WithDeadline(context.Background(), f.expires)
 	defer cancel()
 
 	for {
-		_, err := f.u.BreakLease(breakCtx, -1, azblob.ModifiedAccessConditions{})
+		_, err := f.u.ReleaseLease(releaseCtx, f.leaseID, azblob.ModifiedAccessConditions{})
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			time.Sleep(1 * time.Second)
 			continue
@@ -683,11 +692,16 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 		}
 	}
 
+	var leaseID string
+	if lresp != nil {
+		leaseID = lresp.LeaseID()
+	}
+
 	file := &File{
 		flags:   flags,
 		u:       u.ToBlockBlobURL(),
 		fi:      newFileInfo(name, props),
-		leaseID: lresp.LeaseID(),
+		leaseID: leaseID,
 		expires: expires,
 		closed:  signal.New(),
 	}

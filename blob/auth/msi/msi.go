@@ -139,4 +139,3 @@ func fetchMSIToken(authMethod AuthMethod) (*adal.ServicePrincipalToken, error) {
 
 	return spt, spt.Refresh()
 }
-
