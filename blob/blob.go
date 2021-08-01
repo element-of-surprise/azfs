@@ -223,9 +223,25 @@ func (f *File) Close() error {
 	if !reflect.ValueOf(f.closed).IsZero() {
 		defer f.closed.Close()
 		f.closed.Signal(nil, signal.Wait())
+		f.breakLease()
 	}
 
 	return nil
+}
+
+// breakLease will break a file lease or attempt to until the lease expires.
+func (f *File) breakLease() {
+	breakCtx, cancel := context.WithDeadline(context.Background(), f.expires)
+	defer cancel()
+
+	for {
+		_, err := f.u.BreakLease(breakCtx, -1, azblob.ModifiedAccessConditions{})
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		return
+	}
 }
 
 // Stat implements fs.File.Stat().
@@ -691,7 +707,6 @@ type Sys struct {
 type fileInfo struct {
 	name string
 	dir  bool
-	size int64
 	resp *azblob.BlobGetPropertiesResponse
 }
 
