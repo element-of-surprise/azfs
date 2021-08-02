@@ -118,6 +118,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	jsfs "github.com/johnsiilver/fs"
 	"github.com/johnsiilver/golib/signal"
 	"golang.org/x/sync/errgroup"
 )
@@ -583,22 +584,29 @@ type rwOptions struct {
 	tm   azblob.TransferManager
 }
 
-// RWOption are options used for OpenRW().
-type RWOption func(o *rwOptions)
-
 // WithLock locks the file and attempts to keep it locked until the file is closed.
 // If the file in question is a directory, no lease it taken out.
-func WithLock() RWOption {
-	return func(o *rwOptions) {
-		o.lock = true
+func WithLock() jsfs.OFOption {
+	return func(o interface{}) error {
+		opt, ok := o.(*rwOptions)
+		if !ok {
+			return fmt.Errorf("WithLock passed to incorrect function")
+		}
+		opt.lock = true
+		return nil
 	}
 }
 
 // WithTransferManager allows you to provide one of azblob's TransferManagers or your
 // own TransferManager for controlling file writes.
-func WithTransferManager(tm azblob.TransferManager) RWOption {
-	return func(o *rwOptions) {
-		o.tm = tm
+func WithTransferManager(tm azblob.TransferManager) jsfs.OFOption {
+	return func(o interface{}) error {
+		opt, ok := o.(*rwOptions)
+		if !ok {
+			return fmt.Errorf("WithTransferManager passed to incorrect function")
+		}
+		opt.tm = tm
+		return nil
 	}
 }
 
@@ -617,12 +625,14 @@ func isFlagSet(flags int, flag int) bool {
 	return flags&flag != 0
 }
 
-// OpenFile is the generalized open call that provides non-readonly options that Open()
-// provides. When creating a new file, this will always be a block blob.
-func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error) {
+// OpenFile implements github.com/johnsiilver/fs.OpenFilerFS. When creating a new file, this will always be a block blob.
+// The fs.File returned will always be a *File.
+func (f *FS) OpenFile(name string, flags int, options ...jsfs.OFOption) (fs.File, error) {
 	opts := rwOptions{}
 	for _, o := range options {
-		o(&opts)
+		if err := o(&opts); err != nil {
+			return nil, err
+		}
 	}
 
 	if opts.lock {
@@ -710,6 +720,22 @@ func (f *FS) OpenFile(name string, flags int, options ...RWOption) (*File, error
 		file.renew()
 	}
 	return file, nil
+}
+
+// WriteFile implements jsfs.Writer. This implementation takes a lock on each file. Use OpenFile()
+// if you do not with to use locking or want to use other options.
+func (f *FS) WriteFile(name string, data []byte, perm fs.FileMode) error {
+	fsFile, err := f.OpenFile(name, O_WRONLY, WithLock())
+	if err != nil {
+		return err
+	}
+
+	file := fsFile.(*File)
+	_, err = file.Write(data)
+	if err != nil {
+		return err
+	}
+	return file.Close()
 }
 
 // Sys is returned on a FileInfo.Sys() call.
