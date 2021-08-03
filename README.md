@@ -1,4 +1,10 @@
+<p align="right">
+  ⭐ &nbsp;&nbsp;<strong>the project to show your appreciation.</strong> :arrow_upper_right:
+</p>
+
 # AZFS - io/fs Implementations for Azure
+
+[![GoDev](https://img.shields.io/static/v1?label=godev&message=reference&color=00add8)](https://pkg.go.dev/github.com/element-of-surprise/azfs)
 
 ## Introduction
 
