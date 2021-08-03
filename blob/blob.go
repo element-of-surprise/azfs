@@ -11,7 +11,7 @@ This package supports two additional features over io.FS capabilities:
 This currently only support Block Blobs, not Append or Page. We may offer that
 in the future with enough demand.
 
-NOTE: NUMBER ONE MISTAKE: FORGETTING .CLOSE() on WRITING A FILE, SO IT DOESN"T WRITE THE FILE.
+NOTE: NUMBER ONE MISTAKE: FORGETTING .CLOSE() on WRITING A FILE, SO IT DOES NOT WRITE THE FILE.
 
 Open a Blob storage container:
 	cred, err := msi.Token(msi.SystemAssigned{Resource: "https://resource"})
@@ -277,10 +277,11 @@ func (f *File) renew() {
 	}
 
 	go func() {
-		timer := time.NewTicker(renewAt)
+		ticker := time.NewTicker(renewAt)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-timer.C:
+			case <-ticker.C:
 				if err := f.renewLease(); err != nil {
 					log.Printf("(%s) problem renewing lease: %s", f.path, err)
 				}
@@ -639,10 +640,8 @@ func (f *FS) OpenFile(name string, flags int, options ...jsfs.OFOption) (fs.File
 		}
 	}
 
-	if opts.lock {
-		if !isFlagSet(flags, O_WRONLY) {
-			return nil, fmt.Errorf("only O_WRONLY support for locks")
-		}
+	if opts.lock && !isFlagSet(flags, O_WRONLY) {
+		return nil, fmt.Errorf("only O_WRONLY support for locks")
 	}
 
 	if isFlagSet(flags, O_RDONLY) {
