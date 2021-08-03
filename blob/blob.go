@@ -74,7 +74,7 @@ Write a string to a file:
 		// Do something
 	}
 
-	if _, err := io.WriteString(file, `{"Name":"John Doak"}`) (n int, err error); err != nil {
+	if _, err := io.WriteString(file, `{"Name":"John Doak"}`); err != nil {
 		// Do something
 	}
 
@@ -332,6 +332,8 @@ func (f *File) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 type dirReader struct {
+	sync.Mutex
+
 	name    string
 	path    string
 	contURL azblob.ContainerURL
@@ -352,6 +354,9 @@ func newDirReader(dirPath string, contURL azblob.ContainerURL) (*dirReader, erro
 }
 
 func (d *dirReader) ReadDir(n int) ([]fs.DirEntry, error) {
+	d.Lock()
+	defer d.Unlock()
+
 	if n <= 0 {
 		return d.items, nil
 	}
@@ -402,7 +407,6 @@ func (d *dirReader) get() error {
 		d.items = append(d.items, item)
 	}
 
-	mu := sync.Mutex{}
 	g, ctx := errgroup.WithContext(ctx)
 	limiter := make(chan struct{}, 20)
 	for _, blob := range resp.Segment.BlobItems {
@@ -416,8 +420,8 @@ func (d *dirReader) get() error {
 			u := d.contURL.NewBlobURL(blob.Name)
 			resp, err := u.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 			if err == nil {
-				mu.Lock()
-				defer mu.Unlock()
+				d.Lock()
+				defer d.Unlock()
 				d.items = append(d.items, &dirEntry{name: n, fi: newFileInfo(n, resp)})
 			}
 			return err
