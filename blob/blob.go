@@ -14,7 +14,7 @@ in the future with enough demand.
 NOTE: NUMBER ONE MISTAKE: FORGETTING .CLOSE() on WRITING A FILE, SO IT DOES NOT WRITE THE FILE.
 
 Open a Blob storage container:
-	cred, err := msi.Token(msi.SystemAssigned{Resource: "https://resource"})
+	cred, err := msi.Token(msi.SystemAssigned{})
 	if err != nil {
 		panic(err)
 	}
@@ -30,6 +30,7 @@ Read an entire file:
 		// Do something
 	}
 
+	// You could also do fsys.ReadFile() for simplicity.
 	b, err := io.ReadAll(file)
 	if err != nil {
 		// Do something
@@ -64,7 +65,7 @@ Copy a file:
 
 	// The file is not actually written until the file is closed, so it is
 	// important to know if Close() had an error.
-	if err := file.Close(); err != nil {
+	if err := dst.Close(); err != nil {
 		// Do something
 	}
 
